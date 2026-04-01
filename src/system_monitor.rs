@@ -6,13 +6,17 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc as tokio_mpsc;
+use tokio::time::sleep_until;
 use crate::daemon;
+use crate::daemon::scheduler::Scheduler;
 
 pub async fn watch_directories(
     directories: Vec<PathBuf>,
     home_dir: PathBuf,
     config_watch_dirs: Vec<PathBuf>,
     build_command: String,
+    debounce_ms: u64,
+    build_affected_only: bool,
 ) -> Result<()> {
     let (tx, rx) = channel();
     let watcher: RecommendedWatcher = Watcher::new(tx, notify::Config::default())?;
@@ -127,10 +131,11 @@ pub async fn watch_directories(
         }
     });
 
-    // Async side: wait for SIGTERM or SIGINT, and process rebuild events
+    // Async side: debounce-driven rebuild scheduling with SIGTERM/SIGINT
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
-    let mut rebuild_requests = 0;
+    let mut scheduler = Scheduler::new(debounce_ms, build_affected_only);
+    let mut total_events = 0;
 
     loop {
         tokio::select! {
@@ -143,15 +148,42 @@ pub async fn watch_directories(
                 break;
             }
             Some(path) = rebuild_rx.recv() => {
-                rebuild_requests += 1;
-                eprintln!("📝 Rebuild triggered by {:?} (total: {})", path, rebuild_requests);
-                let projects = all_projects.as_ref().clone();
-                let cmd = build_command.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = daemon::handle_build_multi(projects, cmd).await {
-                        eprintln!("❌ Rebuild error: {}", e);
+                total_events += 1;
+                eprintln!("⚠️ Change detected: {:?}", path);
+                scheduler.add(path);
+            }
+            _ = async {
+                match scheduler.deadline() {
+                    Some(dl) => sleep_until(dl).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if scheduler.has_pending() {
+                    let pending = scheduler.take_pending();
+                    let pending_count = pending.len();
+
+                    // Determine which projects to build
+                    let projects = if scheduler.build_affected_only {
+                        // Only rebuild projects whose parent dir is in pending paths
+                        pending.iter()
+                            .filter_map(|p| p.parent().map(|parent| parent.to_path_buf()))
+                            .filter(|root| all_projects.contains(root))
+                            .collect::<Vec<_>>()
+                    } else {
+                        all_projects.as_ref().clone()
+                    };
+
+                    if !projects.is_empty() {
+                        eprintln!("🏗️ Building {} project(s) (debounced {} event(s))...",
+                            projects.len(), pending_count);
+                        let cmd = build_command.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = daemon::handle_build_multi(projects, cmd).await {
+                                eprintln!("❌ Rebuild error: {}", e);
+                            }
+                        });
                     }
-                });
+                }
             }
         }
     }

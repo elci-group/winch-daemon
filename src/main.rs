@@ -143,13 +143,25 @@ async fn main() -> Result<()> {
     // --- Increase inotify limit for watching many directories ---
     let original_limit = increase_inotify_limit().unwrap_or(8192);
 
-    // --- Prepare build command ---
+    // --- Prepare build command and scheduler settings ---
     let build_command = cfg.build_command
         .unwrap_or_else(|| "cargo build".to_string());
+    let debounce_ms = cfg.debounce_ms.unwrap_or(2000);
+    let build_affected_only = cfg.build_affected_only.unwrap_or(false);
+
     eprintln!("⚙️  Build command: {}", build_command);
+    eprintln!("⏱️  Debounce window: {}ms", debounce_ms);
+    eprintln!("🎯 Build mode: {}", if build_affected_only { "affected only" } else { "all projects" });
 
     // --- Start watching (with cleanup on exit) ---
-    let result = system_monitor::watch_directories(watch_dirs, home_dir, cfg.watch_dirs, build_command).await;
+    let result = system_monitor::watch_directories(
+        watch_dirs,
+        home_dir,
+        cfg.watch_dirs,
+        build_command,
+        debounce_ms,
+        build_affected_only,
+    ).await;
 
     // --- Restore inotify limit ---
     let _ = restore_inotify_limit(original_limit);

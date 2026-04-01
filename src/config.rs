@@ -7,6 +7,8 @@ pub struct WinchConfig {
     pub watch_dirs: Vec<PathBuf>,
     pub db_path: Option<String>,
     pub build_command: Option<String>,
+    pub debounce_ms: Option<u64>,
+    pub build_affected_only: Option<bool>,
 }
 
 pub fn load(home_dir: &Path) -> WinchConfig {
