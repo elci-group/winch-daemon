@@ -19,17 +19,39 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 /// Handles building multiple projects concurrently.
-/// Placeholder function: implement the build logic here.
-pub async fn handle_build_multi() -> Result<()> {
-    // Example pseudo-code
-    let root = PathBuf::from(".");
-    
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_dir() {
-            // Perform build logic per directory
-            println!("Found project directory: {:?}", path);
-        }
+/// Spawns a tokio task for each project with the specified build command.
+pub async fn handle_build_multi(projects: Vec<PathBuf>, build_command: String) -> Result<()> {
+    let parts: Vec<&str> = build_command.split_whitespace().collect();
+    let (cmd, args) = if !parts.is_empty() {
+        (parts[0], parts[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    } else {
+        ("cargo", vec!["build".to_string()])
+    };
+
+    for project in projects {
+        let cmd = cmd.to_string();
+        let args = args.clone();
+        tokio::spawn(async move {
+            eprintln!("🔨 Building {:?}...", project);
+            let result = tokio::process::Command::new(&cmd)
+                .args(&args)
+                .current_dir(&project)
+                .output()
+                .await;
+
+            match result {
+                Ok(output) if output.status.success() => {
+                    eprintln!("✅ Build succeeded: {:?}", project);
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    eprintln!("❌ Build failed: {:?}\n{}", project, stderr);
+                }
+                Err(e) => {
+                    eprintln!("❌ Build error: {:?}: {}", project, e);
+                }
+            }
+        });
     }
 
     Ok(())

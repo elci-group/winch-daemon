@@ -6,11 +6,13 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc as tokio_mpsc;
+use crate::daemon;
 
 pub async fn watch_directories(
     directories: Vec<PathBuf>,
     home_dir: PathBuf,
     config_watch_dirs: Vec<PathBuf>,
+    build_command: String,
 ) -> Result<()> {
     let (tx, rx) = channel();
     let watcher: RecommendedWatcher = Watcher::new(tx, notify::Config::default())?;
@@ -18,6 +20,9 @@ pub async fn watch_directories(
 
     // Channel for rebuild events from the blocking loop
     let (rebuild_tx, mut rebuild_rx) = tokio_mpsc::channel::<PathBuf>(100);
+
+    // Share the watched projects with the async side
+    let all_projects = Arc::new(directories.clone());
 
     // Track initially watched directories
     let mut initial_watched = HashSet::new();
@@ -139,8 +144,14 @@ pub async fn watch_directories(
             }
             Some(path) = rebuild_rx.recv() => {
                 rebuild_requests += 1;
-                eprintln!("📝 Rebuild queued for {:?} (total: {})", path, rebuild_requests);
-                // In the future, this could trigger actual rebuild logic
+                eprintln!("📝 Rebuild triggered by {:?} (total: {})", path, rebuild_requests);
+                let projects = all_projects.as_ref().clone();
+                let cmd = build_command.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = daemon::handle_build_multi(projects, cmd).await {
+                        eprintln!("❌ Rebuild error: {}", e);
+                    }
+                });
             }
         }
     }

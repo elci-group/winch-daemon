@@ -6,6 +6,7 @@ pub struct WinchConfig {
     #[serde(default)]
     pub watch_dirs: Vec<PathBuf>,
     pub db_path: Option<String>,
+    pub build_command: Option<String>,
 }
 
 pub fn load(home_dir: &Path) -> WinchConfig {

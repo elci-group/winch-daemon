@@ -143,8 +143,13 @@ async fn main() -> Result<()> {
     // --- Increase inotify limit for watching many directories ---
     let original_limit = increase_inotify_limit().unwrap_or(8192);
 
+    // --- Prepare build command ---
+    let build_command = cfg.build_command
+        .unwrap_or_else(|| "cargo build".to_string());
+    eprintln!("⚙️  Build command: {}", build_command);
+
     // --- Start watching (with cleanup on exit) ---
-    let result = system_monitor::watch_directories(watch_dirs, home_dir, cfg.watch_dirs).await;
+    let result = system_monitor::watch_directories(watch_dirs, home_dir, cfg.watch_dirs, build_command).await;
 
     // --- Restore inotify limit ---
     let _ = restore_inotify_limit(original_limit);
