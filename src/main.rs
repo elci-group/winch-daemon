@@ -4,6 +4,7 @@ mod notifier;
 mod version_map;
 mod workspace;
 mod system_monitor;
+mod config;
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -110,6 +111,9 @@ async fn main() -> Result<()> {
     // --- Home directory ---
     let home_dir = dirs::home_dir().unwrap_or(PathBuf::from("/home/adminx"));
 
+    // --- Load configuration ---
+    let cfg = config::load(&home_dir);
+
     // --- Detect Rust projects ---
     let rust_projects = find_rust_projects(&home_dir);
     if rust_projects.is_empty() {
@@ -128,7 +132,9 @@ async fn main() -> Result<()> {
         .collect();
 
     // --- Ensure version map database exists ---
-    let db_path = home_dir.join(".winch/version_map.sqlite");
+    let db_path = cfg.db_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir.join(".winch/version_map.sqlite"));
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -138,7 +144,7 @@ async fn main() -> Result<()> {
     let original_limit = increase_inotify_limit().unwrap_or(8192);
 
     // --- Start watching (with cleanup on exit) ---
-    let result = system_monitor::watch_directories(watch_dirs, home_dir).await;
+    let result = system_monitor::watch_directories(watch_dirs, home_dir, cfg.watch_dirs).await;
 
     // --- Restore inotify limit ---
     let _ = restore_inotify_limit(original_limit);

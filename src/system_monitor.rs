@@ -7,7 +7,11 @@ use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc as tokio_mpsc;
 
-pub async fn watch_directories(directories: Vec<PathBuf>, home_dir: PathBuf) -> Result<()> {
+pub async fn watch_directories(
+    directories: Vec<PathBuf>,
+    home_dir: PathBuf,
+    config_watch_dirs: Vec<PathBuf>,
+) -> Result<()> {
     let (tx, rx) = channel();
     let watcher: RecommendedWatcher = Watcher::new(tx, notify::Config::default())?;
     let watcher = Arc::new(Mutex::new(watcher));
@@ -31,12 +35,25 @@ pub async fn watch_directories(directories: Vec<PathBuf>, home_dir: PathBuf) -> 
         // Watch home directory (non-recursive) for new project discovery
         w.watch(&home_dir, RecursiveMode::NonRecursive)?;
 
-        // Watch common top-level subdirectories where projects might appear (recursively)
-        for candidate in &["src", "projects", "repos", "workspace", "code", "dev"] {
-            let p = home_dir.join(candidate);
-            if p.is_dir() {
-                let _ = w.watch(&p, RecursiveMode::Recursive);
-            }
+        // Watch configured or default directories for new projects
+        let extra_dirs = if config_watch_dirs.is_empty() {
+            // Use default candidates if no config specified
+            ["src", "projects", "repos", "workspace", "code", "dev"]
+                .iter()
+                .map(|s| home_dir.join(s))
+                .filter(|p| p.is_dir())
+                .collect::<Vec<_>>()
+        } else {
+            // Use config-specified directories
+            config_watch_dirs
+                .iter()
+                .filter(|p| p.is_dir())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        for dir in extra_dirs {
+            let _ = w.watch(&dir, RecursiveMode::Recursive);
         }
     }
 
