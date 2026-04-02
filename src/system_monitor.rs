@@ -1,0 +1,199 @@
+use anyhow::Result;
+use notify::{Watcher, RecommendedWatcher, RecursiveMode, EventKind};
+use std::sync::{Arc, Mutex, mpsc::channel};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashSet;
+use std::path::PathBuf;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio::time::sleep_until;
+use crate::daemon;
+use crate::daemon::scheduler::Scheduler;
+
+pub async fn watch_directories(
+    directories: Vec<PathBuf>,
+    home_dir: PathBuf,
+    config_watch_dirs: Vec<PathBuf>,
+    build_command: String,
+    debounce_ms: u64,
+    build_affected_only: bool,
+) -> Result<()> {
+    let (tx, rx) = channel();
+    let watcher: RecommendedWatcher = Watcher::new(tx, notify::Config::default())?;
+    let watcher = Arc::new(Mutex::new(watcher));
+
+    // Channel for rebuild events from the blocking loop
+    let (rebuild_tx, mut rebuild_rx) = tokio_mpsc::channel::<PathBuf>(100);
+
+    // Share the watched projects with the async side
+    let all_projects = Arc::new(directories.clone());
+
+    // Track initially watched directories
+    let mut initial_watched = HashSet::new();
+    let total_dirs = directories.len();
+
+    // Initialize watcher with project directories
+    {
+        let mut w = watcher.lock().unwrap();
+        eprintln!("⏳ Initializing file watchers for {} directories...", total_dirs);
+        for dir in directories.iter() {
+            w.watch(dir, RecursiveMode::Recursive)?;
+            initial_watched.insert(dir.clone());
+        }
+
+        // Watch home directory (non-recursive) for new project discovery
+        w.watch(&home_dir, RecursiveMode::NonRecursive)?;
+
+        // Watch configured or default directories for new projects
+        let extra_dirs = if config_watch_dirs.is_empty() {
+            // Use default candidates if no config specified
+            ["src", "projects", "repos", "workspace", "code", "dev"]
+                .iter()
+                .map(|s| home_dir.join(s))
+                .filter(|p| p.is_dir())
+                .collect::<Vec<_>>()
+        } else {
+            // Use config-specified directories
+            config_watch_dirs
+                .iter()
+                .filter(|p| p.is_dir())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        for dir in extra_dirs {
+            let _ = w.watch(&dir, RecursiveMode::Recursive);
+        }
+    }
+
+    eprintln!("✅ Watching {} project directories", total_dirs);
+
+    // Set up shutdown signal handling
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    let watcher_clone = watcher.clone();
+    let rebuild_tx_clone = rebuild_tx.clone();
+
+    // Spawn the blocking event loop in a background task
+    let event_loop_handle = tokio::task::spawn_blocking(move || {
+        let mut watched_dirs = initial_watched;
+
+        loop {
+            // Check shutdown flag periodically
+            if shutdown_clone.load(Ordering::Relaxed) {
+                eprintln!("📤 Shutting down file watcher...");
+                break;
+            }
+
+            // Use recv_timeout for periodic shutdown checks
+            match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(Ok(event)) => {
+                    // Check for new Cargo.toml (project discovery)
+                    for path in &event.paths {
+                        if path.file_name() == Some("Cargo.toml".as_ref()) {
+                            if matches!(event.kind, EventKind::Create(_)) {
+                                if let Some(parent) = path.parent() {
+                                    let parent = parent.to_path_buf();
+                                    if !watched_dirs.contains(&parent) {
+                                        eprintln!("✨ New Rust project detected: {:?}", parent);
+                                        if let Ok(mut w) = watcher_clone.lock() {
+                                            if w.watch(&parent, RecursiveMode::Recursive).is_ok() {
+                                                watched_dirs.insert(parent);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Check for changes in existing projects (Modify/Remove events)
+                    for path in &event.paths {
+                        if (path.ends_with("Cargo.toml") || path.ends_with("Cargo.lock"))
+                            && !matches!(event.kind, EventKind::Create(_))
+                        {
+                            eprintln!("⚠️ Change detected: {:?}", path);
+                            // Queue rebuild request for async handler
+                            let _ = rebuild_tx_clone.blocking_send(path.clone());
+                        }
+                    }
+                }
+                Ok(Err(e)) => eprintln!("Watcher error: {:?}", e),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Timeout is expected; loop continues to check shutdown flag
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    eprintln!("Watcher channel disconnected");
+                    break;
+                }
+            }
+        }
+    });
+
+    // Async side: debounce-driven rebuild scheduling with SIGTERM/SIGINT
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut scheduler = Scheduler::new(debounce_ms, build_affected_only);
+    let mut total_events = 0;
+
+    loop {
+        tokio::select! {
+            _ = sigterm.recv() => {
+                eprintln!("📬 Received SIGTERM, initiating graceful shutdown...");
+                break;
+            }
+            _ = sigint.recv() => {
+                eprintln!("📬 Received SIGINT, initiating graceful shutdown...");
+                break;
+            }
+            Some(path) = rebuild_rx.recv() => {
+                total_events += 1;
+                eprintln!("⚠️ Change detected: {:?}", path);
+                scheduler.add(path);
+            }
+            _ = async {
+                match scheduler.deadline() {
+                    Some(dl) => sleep_until(dl).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if scheduler.has_pending() {
+                    let pending = scheduler.take_pending();
+                    let pending_count = pending.len();
+
+                    // Determine which projects to build
+                    let projects = if scheduler.build_affected_only {
+                        // Only rebuild projects whose parent dir is in pending paths
+                        pending.iter()
+                            .filter_map(|p| p.parent().map(|parent| parent.to_path_buf()))
+                            .filter(|root| all_projects.contains(root))
+                            .collect::<Vec<_>>()
+                    } else {
+                        all_projects.as_ref().clone()
+                    };
+
+                    if !projects.is_empty() {
+                        eprintln!("🏗️ Building {} project(s) (debounced {} event(s))...",
+                            projects.len(), pending_count);
+                        let cmd = build_command.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = daemon::handle_build_multi(projects, cmd).await {
+                                eprintln!("❌ Rebuild error: {}", e);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Signal the blocking loop to stop
+    shutdown.store(true, Ordering::Relaxed);
+
+    // Wait for the blocking loop to finish
+    let _ = event_loop_handle.await;
+
+    eprintln!("✅ File watcher stopped");
+    Ok(())
+}
